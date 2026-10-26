@@ -41,7 +41,7 @@
   },
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node build.mjs && node --test tests/*.test.mjs"
   },
   "keywords": ["dsh-plugin", "deepseek-harness", "git", "source-control", "scm"],
   "engines": { "node": "^22.19 || >=24" }

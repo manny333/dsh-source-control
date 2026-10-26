@@ -18,7 +18,14 @@ window.__ModuleLoader__.load({
     const TAB_KIND = 'source-control'
     const STATE_ROUTE = '/dsh-source-control/state'
     const ACTION_ROUTE = '/dsh-source-control/action'
+    const MESSAGE_ROUTE = '/dsh-source-control/message'
     const POLL_MS = 3000
+    // The message box resizes from its whole bottom edge, not the native corner grip.
+    const DRAFT_MIN_HEIGHT = 54
+    const DRAFT_MAX_HEIGHT = 320
+
+    /** The plugin context, captured in `apply` so the panel can reach services. */
+    let pluginCtx = null
 
     const S = {
       root: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, fontSize: 12, lineHeight: 1.45 },
@@ -110,11 +117,50 @@ window.__ModuleLoader__.load({
       }))
     }
 
+    /** Draft a commit message from the diff; the host owns the model call. */
+    async function draftMessage(root, route) {
+      return readJson(await fetch(MESSAGE_ROUTE, {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ root, ...(route || {}) }),
+      }))
+    }
+
+    /**
+     * The provider/model the composer is set to, read from the session's
+     * `modelSelection` projection (`next` is a choice not yet sent).
+     *
+     * Returns null when the session or the projection is unreachable, so the host
+     * falls back to its own configuration instead of failing the call.
+     */
+    function currentRoute(ctx, sessionId) {
+      try {
+        if (!ctx || !sessionId || typeof ctx.get !== 'function') return null
+        const sessions = ctx.get('sessions')
+        if (!sessions || typeof sessions.binding !== 'function') return null
+        const binding = sessions.binding(sessionId)
+        const projections = binding && binding.session && binding.session.projections
+        if (!projections) return null
+        const value = typeof projections.get === 'function'
+          ? projections.get('modelSelection')
+          : (typeof projections.faceOf === 'function'
+            ? projections.faceOf('modelSelection').getSnapshot()
+            : undefined)
+        const selection = value && (value.next || value.lastUsed)
+        if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') return null
+        return { provider: selection.provider, model: selection.model }
+      } catch {
+        return null
+      }
+    }
+
     function Panel(props) {
       const cwd = useCwd(props)
       const [data, setData] = React.useState(null)
       const [message, setMessage] = React.useState('')
       const [busy, setBusy] = React.useState(null)
+      const [generating, setGenerating] = React.useState(false)
       const [error, setError] = React.useState(null)
       // The branch picker and the history are opt-in: both stay closed until asked.
       const [pickerOpen, setPickerOpen] = React.useState(false)
@@ -124,6 +170,50 @@ window.__ModuleLoader__.load({
       const [confirm, setConfirm] = React.useState(null)
       // Key of the file row under the pointer: inline styles cannot express `:hover`.
       const [hovered, setHovered] = React.useState(null)
+      // `provider/model` the last draft came from, so the panel shows what it used.
+      const [generatedBy, setGeneratedBy] = React.useState(null)
+      // Height the person dragged the message box to; `null` keeps the CSS default.
+      const [draftHeight, setDraftHeight] = React.useState(null)
+      const [resizeHot, setResizeHot] = React.useState(false)
+      const textareaRef = React.useRef(null)
+
+      /** Clamp and paint one height; the drag writes the DOM directly to stay smooth. */
+      const applyDraftHeight = (value) => {
+        const next = Math.max(DRAFT_MIN_HEIGHT, Math.min(DRAFT_MAX_HEIGHT, Math.round(value)))
+        if (textareaRef.current) textareaRef.current.style.height = `${next}px`
+        return next
+      }
+
+      const startResize = (event) => {
+        const textarea = textareaRef.current
+        if (!textarea || (event.button !== undefined && event.button !== 0)) return
+        event.preventDefault()
+        const startY = event.clientY
+        const startHeight = textarea.offsetHeight
+        let latest = startHeight
+        setResizeHot(true)
+
+        const move = (moveEvent) => { latest = applyDraftHeight(startHeight + (moveEvent.clientY - startY)) }
+        const finish = () => {
+          window.removeEventListener('pointermove', move)
+          window.removeEventListener('pointerup', finish)
+          window.removeEventListener('pointercancel', finish)
+          setResizeHot(false)
+          setDraftHeight(latest)
+        }
+
+        window.addEventListener('pointermove', move)
+        window.addEventListener('pointerup', finish)
+        window.addEventListener('pointercancel', finish)
+      }
+
+      /** Keyboard parity: focus the grip and use the arrow keys. */
+      const resizeByKey = (event) => {
+        if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return
+        event.preventDefault()
+        const taken = textareaRef.current ? textareaRef.current.offsetHeight : DRAFT_MIN_HEIGHT
+        setDraftHeight(applyDraftHeight(taken + (event.key === 'ArrowUp' ? -8 : 8)))
+      }
 
       const refresh = React.useCallback(async () => {
         if (!cwd) return
@@ -144,18 +234,38 @@ window.__ModuleLoader__.load({
         return () => window.clearInterval(id)
       }, [refresh])
 
+      /** Runs one action; false when it failed, so callers can chain safely. */
       const act = async (action, extra) => {
-        if (!cwd) return
+        if (!cwd) return false
         setBusy(action)
         try {
           const next = await postAction(cwd, action, extra)
           setData(next)
           setError(null)
           if (action === 'commit') setMessage('')
+          return true
+        } catch (cause) {
+          setError(String((cause && cause.message) || cause))
+          return false
+        } finally {
+          setBusy(null)
+        }
+      }
+
+      /** Draft the commit message from the diff; failure lands in the error line. */
+      const generate = async () => {
+        if (!cwd || generating) return
+        setGenerating(true)
+        try {
+          // Use the model the chat is on; the host falls back when it is unknown.
+          const result = await draftMessage(cwd, currentRoute(pluginCtx, props.sessionId))
+          setMessage(String(result.message || ''))
+          setGeneratedBy(result.provider && result.model ? `${result.provider}/${result.model}` : null)
+          setError(null)
         } catch (cause) {
           setError(String((cause && cause.message) || cause))
         } finally {
-          setBusy(null)
+          setGenerating(false)
         }
       }
 
@@ -195,9 +305,15 @@ window.__ModuleLoader__.load({
       const untracked = status ? status.untracked : []
       const ahead = status ? status.ahead : 0
       const behind = status ? status.behind : 0
-      const noUpstream = Boolean(status && status.upstream === null && status.branch !== null)
+      // `upstream === null` alone does not mean the branch is missing on the
+      // remote: it can exist there without local tracking. Only offer publishing
+      // when the remote-tracking ref is absent too.
+      const remoteRef = status && status.branch !== null
+        ? branches.find((branch) => branch.kind === 'remote' && branch.branch === status.branch)
+        : undefined
+      const unpublished = Boolean(status && status.branch !== null && status.upstream === null && !remoteRef)
       const dirty = staged.length + unstaged.length + untracked.length > 0
-      const canCommit = busy === null && message.trim() !== '' && staged.length > 0
+      const canCommit = busy === null && !generating && message.trim() !== '' && staged.length > 0
       const trackedChanged = staged.length + unstaged.length
       const discardSummary = [
         trackedChanged > 0 ? `${trackedChanged} archivo${trackedChanged === 1 ? '' : 's'} con cambios` : null,
@@ -327,7 +443,7 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', style: S.primary, disabled: busy !== null, onClick: () => void act('pull') }, 'Pull'),
         ) : null,
 
-        noUpstream ? h('div', { style: S.banner },
+        unpublished ? h('div', { style: S.banner },
           h('span', { style: S.bannerText }, `La rama ${status.branch} no existe en el remoto`),
           h('button', { type: 'button', style: S.primary, disabled: busy !== null, onClick: () => void act('publish') }, 'Publish Branch'),
         ) : null,
@@ -345,21 +461,73 @@ window.__ModuleLoader__.load({
 
           h('div', null,
             h('textarea', {
-              style: S.textarea,
+              ref: textareaRef,
+              style: {
+                ...S.textarea,
+                resize: 'none',
+                maxHeight: DRAFT_MAX_HEIGHT,
+                ...(draftHeight === null ? {} : { height: draftHeight }),
+              },
               placeholder: dirty ? 'Mensaje de commit…' : 'Sin cambios para commitear',
               value: message,
               disabled: busy !== null,
               onChange: (event) => setMessage(event.target.value),
             }),
-            h('div', { style: { display: 'flex', gap: 6, marginTop: 6 } },
+            /* The whole bottom edge drags; the native corner grip is off. */
+            h('div', {
+              role: 'separator',
+              'aria-orientation': 'horizontal',
+              'aria-label': 'Cambiar el alto de la caja de mensaje',
+              tabIndex: 0,
+              title: 'Arrastra el borde inferior para cambiar el alto',
+              style: {
+                height: 9,
+                marginTop: -1,
+                cursor: 'ns-resize',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                borderRadius: '0 0 6px 6px',
+                touchAction: 'none',
+                outline: 'none',
+              },
+              onPointerDown: startResize,
+              onMouseEnter: () => setResizeHot(true),
+              onMouseLeave: () => setResizeHot(false),
+              onKeyDown: resizeByKey,
+            },
+              h('span', {
+                style: {
+                  width: 36,
+                  height: 2,
+                  borderRadius: 1,
+                  background: resizeHot ? 'rgba(80,140,255,.9)' : 'rgba(127,127,127,.35)',
+                  transition: 'background-color 120ms ease',
+                },
+              }),
+            ),
+            h('div', { style: { display: 'flex', gap: 6, marginTop: 2 } },
               h('button', {
                 type: 'button', style: S.primary, disabled: !canCommit,
                 onClick: () => void act('commit', { message }),
               }, busy === 'commit' ? 'Commit…' : 'Commit'),
               h('button', {
                 type: 'button', style: { ...S.primary, background: 'rgba(127,127,127,.14)' }, disabled: !canCommit,
-                onClick: async () => { await act('commit', { message }); if (cwd) await act('push') },
+                onClick: async () => { if (await act('commit', { message })) await act('push') },
               }, 'Commit & Push'),
+              h('button', {
+                type: 'button',
+                style: { ...S.primary, background: 'rgba(127,127,127,.14)', marginLeft: 'auto' },
+                disabled: !dirty || busy !== null || generating,
+                title: 'Redactar el mensaje con IA a partir del diff',
+                onClick: () => void generate(),
+              }, generating ? '✨ Generando…' : '✨ IA'),
+              generatedBy !== null && !generating
+                ? h('span', {
+                  style: { ...S.muted, fontSize: 10, alignSelf: 'center', whiteSpace: 'nowrap' },
+                  title: 'Proveedor y modelo que redactaron el mensaje',
+                }, generatedBy)
+                : null,
             ),
             h('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 6 } },
               h('button', {
@@ -426,6 +594,7 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
+      pluginCtx = ctx
       // The tab registry is reached lazily: a static inject that never resolves
       // parks the plugin forever and `apply` never runs.
       ctx.inject(['sidebarRightTabs'], (owner) => {

@@ -1,7 +1,11 @@
 /**
  * dsh-source-control — local Git engine.
- * Runs `git` with execFile (never a shell), parses porcelain v2 status and log
- * output, and keeps error text free of credentials.
+ * Runs `git` with execFile (never a shell), parses NUL-separated porcelain v2
+ * status and log output, and keeps error text free of credentials.
+ *
+ * Status is read with `-z` on purpose: without it git C-quotes any path that is
+ * not plain ASCII (`"a\303\261o.txt"`), and the panel would show — and act on —
+ * an escaped string instead of the file name.
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -83,11 +87,23 @@ export function assertRoot(root: string): string {
   return root
 }
 
+/**
+ * Pathspec that matches the bytes given and nothing else.
+ *
+ * The panel receives exact paths from `status`, but git reads a bare argument
+ * after `--` as a glob with pathspec magic: a file named `a*b.txt` would also
+ * match `axb.txt`, and one named `:x` would be a magic error.
+ */
+export function literalPath(path: string): string {
+  return `:(literal)${path}`
+}
+
 function letter(ch: string): string | null {
   return ch === '.' || ch === ' ' ? null : ch
 }
 
 function addChange(status: GitStatus, xy: string, path: string, origPath?: string): void {
+  if (path === '') return
   const [x, y] = [xy[0] ?? '.', xy[1] ?? '.']
   const staged = letter(x)
   const worktree = letter(y)
@@ -95,7 +111,29 @@ function addChange(status: GitStatus, xy: string, path: string, origPath?: strin
   if (worktree !== null) status.unstaged.push({ path, origPath, status: worktree, staged: false })
 }
 
-/** Parse `git status --porcelain=v2 --branch` output. */
+/** Everything after the first `count` space-separated fields — paths may hold spaces. */
+function afterFields(line: string, count: number): string {
+  let index = 0
+  for (let seen = 0; seen < count; seen += 1) {
+    index = line.indexOf(' ', index)
+    if (index < 0) return ''
+    index += 1
+  }
+  return line.slice(index)
+}
+
+/** Arguments for a NUL-terminated, unquoted, machine-readable status query. */
+export function statusArgs(): string[] {
+  return ['status', '--porcelain=v2', '--branch', '-z']
+}
+
+/**
+ * Parse `git status --porcelain=v2 --branch` output.
+ *
+ * Both shapes are understood: NUL records (`-z`, what {@link statusArgs}
+ * asks for) and newline records, which keep the TAB separator before a
+ * rename's original path.
+ */
 export function parseStatus(raw: string, root = ''): GitStatus {
   const status: GitStatus = {
     root,
@@ -110,7 +148,11 @@ export function parseStatus(raw: string, root = ''): GitStatus {
     operationInProgress: false,
   }
 
-  for (const line of raw.split(/\r?\n/)) {
+  const nul = raw.includes('\0')
+  const records = nul ? raw.split('\0') : raw.split(/\r?\n/)
+
+  for (let i = 0; i < records.length; i += 1) {
+    const line = records[i]
     if (line === '') continue
     if (line.startsWith('# branch.head ')) {
       const head = line.slice('# branch.head '.length).trim()
@@ -129,34 +171,30 @@ export function parseStatus(raw: string, root = ''): GitStatus {
       }
       continue
     }
-    if (line.startsWith('# branch.oid ')) {
-      const oid = line.slice('# branch.oid '.length).trim()
-      if (oid === '(initial)') status.branch = status.branch ?? null
-      continue
-    }
 
     const kind = line[0]
     if (kind === '1') {
-      const parts = line.split(' ')
-      const xy = parts[1] ?? '..'
-      const path = parts.slice(8).join(' ')
-      addChange(status, xy, path)
+      addChange(status, line.slice(2, 4), afterFields(line, 8))
     } else if (kind === '2') {
-      const parts = line.split(' ')
-      const xy = parts[1] ?? '..'
-      const tail = parts.slice(9).join(' ')
-      const [path, origPath] = tail.split('\t')
-      addChange(status, xy, path, origPath)
+      // `<path>` then, with -z, the original path as the next NUL record;
+      // without -z, one field `path<TAB>origPath`.
+      const current = afterFields(line, 9)
+      if (nul) {
+        const original = records[i + 1] ?? ''
+        if (original !== '') i += 1
+        addChange(status, line.slice(2, 4), current, original || undefined)
+      } else {
+        const tab = current.indexOf('\t')
+        if (tab < 0) addChange(status, line.slice(2, 4), current)
+        else addChange(status, line.slice(2, 4), current.slice(0, tab), current.slice(tab + 1))
+      }
     } else if (kind === 'u') {
-      const parts = line.split(' ')
-      const xy = parts[1] ?? 'UU'
-      const path = parts.slice(10).join(' ')
       status.mergeState = 'unmerged'
-      status.unstaged.push({ path, status: 'U', staged: false })
       status.operationInProgress = true
-      void xy
+      status.unstaged.push({ path: afterFields(line, 10), status: 'U', staged: false })
     } else if (kind === '?') {
-      status.untracked.push(line.slice(2))
+      const path = afterFields(line, 1)
+      if (path !== '') status.untracked.push(path)
     }
   }
 
@@ -272,18 +310,22 @@ export function parseBranches(raw: string): BranchEntry[] {
   return [...locals, ...remotes]
 }
 
-const BRANCH_NAME_RE = /^[A-Za-z0-9._/@+-]+$/
+/** Bytes git refuses in a ref name: control, space, and the shell-glob set. */
+const INVALID_BRANCH_CHARS = /[\u0000-\u0020\u007f~^:?*[\\]/
 
 /**
  * Reject a branch name that git would read as an option or that is not a ref.
- * The panel never passes user text into a shell, but `git switch -x` would still
+ * Unicode is allowed — git accepts it, and this project lives in Spanish. The
+ * panel never passes user text into a shell, but `git switch -x` would still
  * be parsed as a flag, so the leading dash is refused here.
  */
 export function assertBranchName(name: unknown): string {
   const value = typeof name === 'string' ? name : ''
-  const invalid = value === '' || value.length > 255 || !BRANCH_NAME_RE.test(value) ||
+  const invalid = value === '' || value.length > 255 ||
+    INVALID_BRANCH_CHARS.test(value) ||
     value.startsWith('-') || value.startsWith('/') || value.endsWith('/') ||
-    value.includes('..') || value.includes('//') || value.endsWith('.lock')
+    value.endsWith('.') || value.includes('..') || value.includes('//') ||
+    value.includes('@{') || value.split('/').some(segment => segment.endsWith('.lock'))
   if (invalid) {
     throw Object.assign(new Error(`dsh-source-control: invalid branch name "${value}"`), {
       code: 'invalid-branch',
