@@ -23,6 +23,25 @@ window.__ModuleLoader__.load({
     // The message box resizes from its whole bottom edge, not the native corner grip.
     const DRAFT_MIN_HEIGHT = 54
     const DRAFT_MAX_HEIGHT = 320
+    const COMMIT_MODE_KEY = 'dsh-source-control:commit-mode'
+
+    /** `'ask' | 'always' | 'never'`: what Commit does when nothing is staged. */
+    function readCommitMode() {
+      try {
+        const value = window.localStorage.getItem(COMMIT_MODE_KEY)
+        return value === 'always' || value === 'never' ? value : 'ask'
+      } catch {
+        return 'ask'
+      }
+    }
+
+    function writeCommitMode(mode) {
+      try {
+        window.localStorage.setItem(COMMIT_MODE_KEY, mode)
+      } catch {
+        // Storage may be unavailable (private mode, blocked origin): keep the choice in memory.
+      }
+    }
 
     /** The plugin context, captured in `apply` so the panel can reach services. */
     let pluginCtx = null
@@ -66,6 +85,8 @@ window.__ModuleLoader__.load({
       confirmBox: { display: 'flex', flexDirection: 'column', gap: 6, padding: '8px 10px', borderRadius: 6, background: 'rgba(224,112,112,.10)', border: '1px solid rgba(224,112,112,.35)', fontSize: 11 },
       danger: { cursor: 'pointer', border: '1px solid rgba(224,112,112,.5)', background: 'rgba(224,112,112,.18)', color: '#e07070', borderRadius: 5, padding: '1px 8px', fontSize: 11, fontWeight: 600 },
       dangerText: { background: 'transparent', border: 'none', color: '#e07070', cursor: 'pointer', font: 'inherit', fontSize: 11, padding: 0, opacity: 0.9 },
+      promptBox: { display: 'flex', flexDirection: 'column', gap: 6, padding: '8px 10px', marginTop: 6, borderRadius: 6, background: 'rgba(80,140,255,.10)', border: '1px solid rgba(80,140,255,.35)', fontSize: 11 },
+      link: { background: 'transparent', border: 'none', color: 'inherit', cursor: 'pointer', font: 'inherit', fontSize: 10, padding: 0, textDecoration: 'underline', opacity: 0.85 },
     }
 
     const LETTER = { A: 'A', M: 'M', D: 'D', R: 'R', C: 'C', U: 'U', T: 'T' }
@@ -172,6 +193,10 @@ window.__ModuleLoader__.load({
       const [hovered, setHovered] = React.useState(null)
       // `provider/model` the last draft came from, so the panel shows what it used.
       const [generatedBy, setGeneratedBy] = React.useState(null)
+      // What Commit does with nothing staged: ask (default), always stage, or never.
+      const [commitMode, setCommitMode] = React.useState(readCommitMode)
+      // `null` | { push }: the inline question before staging everything.
+      const [commitPrompt, setCommitPrompt] = React.useState(null)
       // Height the person dragged the message box to; `null` keeps the CSS default.
       const [draftHeight, setDraftHeight] = React.useState(null)
       const [resizeHot, setResizeHot] = React.useState(false)
@@ -269,6 +294,42 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const rememberCommitMode = (mode) => {
+        setCommitMode(mode)
+        writeCommitMode(mode)
+      }
+
+      /** Commit what is staged, and push after a successful commit when asked. */
+      const commitNow = async (pushAfter) => {
+        if (!(await act('commit', { message }))) return
+        if (pushAfter) await act('push')
+      }
+
+      /** Stage everything, then commit — the answer to the inline question. */
+      const commitStagingAll = async (pushAfter) => {
+        setCommitPrompt(null)
+        if (!(await act('stageAll'))) return
+        await commitNow(pushAfter)
+      }
+
+      /**
+       * Commit, asking first when nothing is staged — the VS Code behaviour:
+       * ask, always stage, or never stage are the three remembered answers.
+       */
+      const requestCommit = (pushAfter) => {
+        if (busy !== null || generating || message.trim() === '' || !dirty) return
+        if (staged.length > 0) {
+          void commitNow(pushAfter)
+          return
+        }
+        if (commitMode === 'always') {
+          void commitStagingAll(pushAfter)
+          return
+        }
+        if (commitMode === 'never') return
+        setCommitPrompt({ push: pushAfter })
+      }
+
       const togglePicker = () => {
         setPickerOpen((open) => !open)
         setFilter('')
@@ -313,7 +374,33 @@ window.__ModuleLoader__.load({
         : undefined
       const unpublished = Boolean(status && status.branch !== null && status.upstream === null && !remoteRef)
       const dirty = staged.length + unstaged.length + untracked.length > 0
-      const canCommit = busy === null && !generating && message.trim() !== '' && staged.length > 0
+      // With changes to stage, Commit stays available: it asks before staging all.
+      const canCommit = busy === null && !generating && message.trim() !== '' && dirty &&
+        (staged.length > 0 || commitMode !== 'never')
+      const canGenerate = dirty && busy === null && !generating
+      // A disabled button that looks enabled reads as a dead click; say why instead.
+      const commitHint = !dirty
+        ? null
+        : staged.length === 0
+          ? (commitMode === 'always'
+            ? 'No hay cambios preparados: se prepararán todos al commitear.'
+            : commitMode === 'never'
+              ? 'No hay cambios preparados y la preparación automática está desactivada.'
+              : 'No hay cambios preparados: Commit te preguntará si preparar todos.')
+          : message.trim() === ''
+            ? 'Escribe el mensaje para commitear.'
+            : null
+      const commitTitle = !canCommit
+        ? (commitHint || 'Nada que commitear')
+        : staged.length > 0
+          ? 'Commit de lo preparado'
+          : 'Commit: se ofrecerá preparar todos los cambios'
+      const commitPushTitle = !canCommit
+        ? (commitHint || 'Nada que commitear')
+        : staged.length > 0
+          ? 'Commit y push de lo preparado'
+          : 'Commit y push: se ofrecerá preparar todos los cambios'
+      const disabledStyle = enabled => (enabled ? {} : { opacity: 0.45, cursor: 'not-allowed' })
       const trackedChanged = staged.length + unstaged.length
       const discardSummary = [
         trackedChanged > 0 ? `${trackedChanged} archivo${trackedChanged === 1 ? '' : 's'} con cambios` : null,
@@ -443,6 +530,17 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', style: S.primary, disabled: busy !== null, onClick: () => void act('pull') }, 'Pull'),
         ) : null,
 
+        /* Symmetric to Pull: an upstream exists, so there is somewhere to send to. */
+        ahead > 0 && status.upstream !== null ? h('div', { style: S.banner },
+          h('span', { style: S.bannerText },
+            `${ahead} commit${ahead === 1 ? '' : 's'} sin enviar a ${status.upstream}`),
+          h('button', {
+            type: 'button', style: S.primary, disabled: busy !== null,
+            title: `Enviar los commits locales a ${status.upstream}`,
+            onClick: () => void act('push'),
+          }, busy === 'push' ? 'Push…' : 'Push'),
+        ) : null,
+
         unpublished ? h('div', { style: S.banner },
           h('span', { style: S.bannerText }, `La rama ${status.branch} no existe en el remoto`),
           h('button', { type: 'button', style: S.primary, disabled: busy !== null, onClick: () => void act('publish') }, 'Publish Branch'),
@@ -508,27 +606,63 @@ window.__ModuleLoader__.load({
             ),
             h('div', { style: { display: 'flex', gap: 6, marginTop: 2 } },
               h('button', {
-                type: 'button', style: S.primary, disabled: !canCommit,
-                onClick: () => void act('commit', { message }),
+                type: 'button', style: { ...S.primary, ...disabledStyle(canCommit) }, disabled: !canCommit,
+                title: commitTitle,
+                onClick: () => void requestCommit(false),
               }, busy === 'commit' ? 'Commit…' : 'Commit'),
               h('button', {
-                type: 'button', style: { ...S.primary, background: 'rgba(127,127,127,.14)' }, disabled: !canCommit,
-                onClick: async () => { if (await act('commit', { message })) await act('push') },
+                type: 'button',
+                style: { ...S.primary, background: 'rgba(127,127,127,.14)', ...disabledStyle(canCommit) },
+                disabled: !canCommit,
+                title: commitPushTitle,
+                onClick: () => void requestCommit(true),
               }, 'Commit & Push'),
               h('button', {
                 type: 'button',
-                style: { ...S.primary, background: 'rgba(127,127,127,.14)', marginLeft: 'auto' },
-                disabled: !dirty || busy !== null || generating,
-                title: 'Redactar el mensaje con IA a partir del diff',
+                style: { ...S.primary, background: 'rgba(127,127,127,.14)', marginLeft: 'auto', ...disabledStyle(canGenerate) },
+                disabled: !canGenerate,
+                // The route stays out of the layout: it belongs in the tooltip.
+                title: canGenerate
+                  ? `Redactar el mensaje con IA a partir del diff${generatedBy === null ? '' : ` · último: ${generatedBy}`}`
+                  : 'Sin cambios que describir',
                 onClick: () => void generate(),
               }, generating ? '✨ Generando…' : '✨ IA'),
-              generatedBy !== null && !generating
-                ? h('span', {
-                  style: { ...S.muted, fontSize: 10, alignSelf: 'center', whiteSpace: 'nowrap' },
-                  title: 'Proveedor y modelo que redactaron el mensaje',
-                }, generatedBy)
-                : null,
             ),
+            commitPrompt !== null ? h('div', { style: S.promptBox },
+              h('div', null,
+                `No hay cambios preparados. ¿Preparar todo${commitPrompt.push ? ', commitear y enviar' : ' y commitear'}?`),
+              h('div', { style: { display: 'flex', gap: 6, justifyContent: 'flex-end' } },
+                h('button', {
+                  type: 'button', style: S.primary, disabled: busy !== null,
+                  onClick: () => void commitStagingAll(commitPrompt.push),
+                }, 'Sí'),
+                h('button', {
+                  type: 'button', style: S.mini, disabled: busy !== null,
+                  title: 'Preparar todo automáticamente en los próximos commits',
+                  onClick: () => { rememberCommitMode('always'); void commitStagingAll(commitPrompt.push) },
+                }, 'Siempre'),
+                h('button', {
+                  type: 'button', style: S.mini, disabled: busy !== null,
+                  title: 'No volver a ofrecerlo: prepara los archivos a mano',
+                  onClick: () => { rememberCommitMode('never'); setCommitPrompt(null) },
+                }, 'Nunca'),
+                h('button', {
+                  type: 'button', style: S.mini, disabled: busy !== null,
+                  onClick: () => setCommitPrompt(null),
+                }, 'Cancelar'),
+              ),
+            ) : null,
+            commitHint !== null
+              ? h('div', { style: { ...S.muted, fontSize: 10, marginTop: 4, display: 'flex', gap: 6, alignItems: 'center' } },
+                h('span', null, commitHint),
+                commitMode === 'never' && staged.length === 0
+                  ? h('button', {
+                    type: 'button', style: S.link,
+                    title: 'Volver a ofrecer preparar todos los cambios',
+                    onClick: () => rememberCommitMode('ask'),
+                  }, 'Volver a preguntar')
+                  : null)
+              : null,
             h('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 6 } },
               h('button', {
                 type: 'button',

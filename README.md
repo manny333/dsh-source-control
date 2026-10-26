@@ -11,10 +11,15 @@ Panel de control de código fuente para DeepSeek Harness, al estilo de VS Code, 
   reutiliza la local si ya existe. Las ramas cuyo upstream fue borrado se marcan
   como *borrada*.
 - **Pull**: si el remoto tiene commits nuevos, aparece un aviso con el contador y el botón.
+- **Push**: si la rama tiene commits sin enviar, aparece el aviso simétrico con el
+  contador y el botón (solo cuando hay upstream; sin él manda *Publish Branch*).
 - **Publish Branch**: si la rama no existe en el remoto, se ofrece publicarla con `push -u origin HEAD`.
 - **Commit**: caja de mensaje, `Commit` y `Commit & Push`. La caja se redimensiona
   arrastrando cualquier punto de su borde inferior (o con ↑/↓ cuando el tirador tiene
-  el foco). El botón **✨ IA** redacta el mensaje a partir del diff (ver
+  el foco). Si no hay nada preparado, pregunta antes de preparar todo
+  (**Sí / Siempre / Nunca / Cancelar**), como VS Code, y recuerda la respuesta en
+  `localStorage`; *Nunca* deja un enlace para volver a preguntar. El botón **✨ IA**
+  redacta el mensaje a partir del diff (ver
   [Mensaje de commit con IA](#mensaje-de-commit-con-ia)).
 - **Archivos modificados**: staged / changes / untracked, con preparar y quitar del índice.
 - **Descartar cambios**: `↺` por archivo y `↺ Descartar todos los cambios` para el
