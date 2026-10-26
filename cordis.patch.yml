@@ -1,0 +1,4 @@
+# dsh-source-control bundle: mount the host plugin under its package name.
+- insert:
+    - id: source-control
+      name: dsh-source-control
